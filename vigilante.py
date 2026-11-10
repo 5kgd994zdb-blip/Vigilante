@@ -89,9 +89,10 @@ def is_blocked(html):
 
 
 def send_telegram(text):
+    """Envía un mensaje. Devuelve True si Telegram lo ha aceptado."""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         log("(Telegram no configurado) " + text.replace("\n", " | "))
-        return
+        return False
     data = urllib.parse.urlencode({
         "chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML",
     }).encode()
@@ -99,12 +100,16 @@ def send_telegram(text):
         urllib.request.urlopen(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
             data=data, timeout=15).read()
+        return True
     except urllib.error.URLError as e:
         log(f"Error enviando a Telegram: {e}")
+        return False
 
 
 PRICE_RE = re.compile(r"(\d{1,3}(?:\.\d{3})*,\d{2})(?:\s|&nbsp;|\u00a0)*€")
-ASIN_RE = re.compile(r'data-asin="([A-Z0-9]{10})"')
+# El producto se reconoce por data-asin="..." o por enlaces /dp/ASIN
+# (las páginas de "Los que más suben" solo traen los enlaces).
+ASIN_RE = re.compile(r'data-asin="([A-Z0-9]{10})"|/dp/([A-Z0-9]{10})')
 TITLE_RES = [
     re.compile(r'<img[^>]+alt="([^"]{8,})"'),
     re.compile(r'class="[^"]*line-clamp[^"]*"[^>]*>\s*([^<]{8,})<'),
@@ -121,8 +126,13 @@ def unescape(s):
 
 
 def parse_items(html):
+    """Extrae (asin, título, precio) de una página de listados."""
     items = {}
-    marks = [(m.start(), m.group(1)) for m in ASIN_RE.finditer(html)]
+    marks = []
+    for m in ASIN_RE.finditer(html):
+        asin = m.group(1) or m.group(2)
+        if not marks or marks[-1][1] != asin:
+            marks.append((m.start(), asin))
     for i, (pos, asin) in enumerate(marks):
         end = marks[i + 1][0] if i + 1 < len(marks) else min(len(html), pos + 8000)
         block = html[pos:end]
@@ -145,6 +155,7 @@ ADULT_RE = re.compile(r"adult[oa]s?|coleccionist", re.I)
 
 
 def toy_ok(title):
+    """True si el juguete parece apto hasta 7-8 años (o no indica edad)."""
     if ADULT_RE.search(title):
         return False
     ages = [int(a) for a in AGE_PLUS_RE.findall(title)]
@@ -172,6 +183,7 @@ def save_state(state):
 
 
 def check_product(state, asin, title, price, category):
+    """Registra el precio y devuelve un aviso si es un posible error."""
     now = time.time()
     p = state["products"].setdefault(asin, {"title": title, "prices": [],
                                             "cat": category})
@@ -212,27 +224,30 @@ def main():
     alerts = []
     seen = 0
 
-    for category, paths in PAGES.items():
-        for path in paths:
-            try:
-                html = fetch(path)
-            except Exception as e:
-                log(f"Fallo al leer {path}: {e}")
-                pages_blocked += 1
-                continue
-            if is_blocked(html):
-                log(f"Amazon pide captcha en {path}")
-                pages_blocked += 1
-                continue
-            items = parse_items(html)
-            pages_ok += 1
-            seen += len(items)
-            log(f"{path}: {len(items)} productos")
-            for asin, (title, price) in items.items():
-                a = check_product(state, asin, title, price, category)
-                if a:
-                    alerts.append(a)
-            time.sleep(random.uniform(2, 5))
+    # Orden aleatorio en cada pasada: si Amazon bloquea a mitad, la próxima
+    # vez se empieza por otras páginas y, entre pasadas, se cubre todo.
+    jobs = [(c, p) for c, paths in PAGES.items() for p in paths]
+    random.shuffle(jobs)
+    for category, path in jobs:
+        try:
+            html = fetch(path)
+        except Exception as e:
+            log(f"Fallo al leer {path}: {e}")
+            pages_blocked += 1
+            continue
+        if is_blocked(html):
+            log(f"Amazon pide captcha en {path}")
+            pages_blocked += 1
+            continue
+        items = parse_items(html)
+        pages_ok += 1
+        seen += len(items)
+        log(f"{path}: {len(items)} productos")
+        for asin, (title, price) in items.items():
+            a = check_product(state, asin, title, price, category)
+            if a:
+                alerts.append(a)
+        time.sleep(random.uniform(4, 8))
 
     for a in alerts:
         send_telegram(format_alert(a))
@@ -248,11 +263,12 @@ def main():
             send_telegram("✅ El vigilante vuelve a leer Amazon con normalidad.")
         state["blocked_runs"] = 0
 
-    if not state.get("welcomed") and pages_ok:
-        send_telegram(f"✅ Vigilante activo. Primera lectura: {seen} productos. "
-                      f"Avisará de bajadas de ≥{MIN_DROP_PCT:.0f}% cuando tenga "
-                      f"{MIN_OBS} lecturas de cada producto (~30 min).")
-        state["welcomed"] = True
+    if not state.get("bienvenida_ok") and pages_ok:
+        ok = send_telegram(
+            f"✅ Vigilante activo. Esta pasada: {seen} productos leídos, "
+            f"{len(state['products'])} en el historial. Te avisaré de bajadas "
+            f"de ≥{MIN_DROP_PCT:.0f}% respecto al precio habitual.")
+        state["bienvenida_ok"] = ok
 
     save_state(state)
     log(f"Fin: {pages_ok} páginas leídas, {pages_blocked} fallidas, "
