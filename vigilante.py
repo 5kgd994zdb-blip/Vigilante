@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Vigilante de errores de precio en Amazon.es -> tu Telegram privado
-Se ejecuta cada ~10 minutos en GitHub Actions (gratis).
+Se ejecuta en GitHub Actions (gratis).
 """
 
 import gzip
@@ -108,7 +108,6 @@ def send_telegram(text):
 
 PRICE_RE = re.compile(r"(\d{1,3}(?:\.\d{3})*,\d{2})(?:\s|&nbsp;|\u00a0)*€")
 # El producto se reconoce por data-asin="..." o por enlaces /dp/ASIN
-# (las páginas de "Los que más suben" solo traen los enlaces).
 ASIN_RE = re.compile(r'data-asin="([A-Z0-9]{10})"|/dp/([A-Z0-9]{10})')
 TITLE_RES = [
     re.compile(r'<img[^>]+alt="([^"]{8,})"'),
@@ -242,7 +241,15 @@ def main():
         items = parse_items(html)
         pages_ok += 1
         seen += len(items)
-        log(f"{path}: {len(items)} productos")
+        if items:
+            log(f"{path}: {len(items)} productos")
+        else:
+            # Diagnóstico: qué ha devuelto Amazon cuando no se leen productos
+            t = re.search(r"<title>(.*?)</title>", html, re.S)
+            log(f"{path}: 0 productos (título: "
+                f"{t.group(1).strip()[:80] if t else '?'}, "
+                f"{len(html) // 1024} KB, enlaces /dp/: "
+                f"{html.count('/dp/')}, precios: {len(PRICE_RE.findall(html))})")
         for asin, (title, price) in items.items():
             a = check_product(state, asin, title, price, category)
             if a:
